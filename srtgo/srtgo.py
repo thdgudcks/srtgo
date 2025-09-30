@@ -717,23 +717,18 @@ def reserve(rail_type="SRT", debug=False):
             _sleep()
 
         except SRTError as ex:
+            error_handler = ErrorHandler(debug=debug)
             msg = ex.msg
-            if "정상적인 경로로 접근 부탁드립니다" in msg or isinstance(
-                ex, SRTNetFunnelError
-            ):
-                if debug:
-                    print(
-                        f"\nException: {ex}\nType: {type(ex)}\nArgs: {ex.args}\nMessage: {msg}"
-                    )
+
+            if "정상적인 경로로 접근 부탁드립니다" in msg or isinstance(ex, SRTNetFunnelError):
+                error_handler.handle_error(ex, "SRT 보안")
                 rail.clear()
             elif "로그인 후 사용하십시오" in msg:
-                if debug:
-                    print(
-                        f"\nException: {ex}\nType: {type(ex)}\nArgs: {ex.args}\nMessage: {msg}"
-                    )
+                error_handler.handle_error(ex, "SRT 인증")
                 rail = login(rail_type, debug=debug)
-                if not rail.is_login and not _handle_error(ex):
-                    return
+                if not rail.is_login:
+                    if not error_handler.handle_error(ex, "SRT 로그인"):
+                        return
             elif not any(
                 err in msg
                 for err in (
@@ -743,41 +738,44 @@ def reserve(rail_type="SRT", debug=False):
                     "예약대기자한도수초과",
                 )
             ):
-                if not _handle_error(ex):
+                if not error_handler.handle_error(ex, "SRT"):
                     return
             _sleep()
 
         except KorailError as ex:
+            error_handler = ErrorHandler(debug=debug)
             msg = ex.msg
+
             if "Need to Login" in msg:
+                error_handler.handle_error(ex, "코레일 인증")
                 rail = login(rail_type, debug=debug)
-                if not rail.is_login and not _handle_error(ex):
-                    return
+                if not rail.is_login:
+                    if not error_handler.handle_error(ex, "코레일 로그인"):
+                        return
             elif not any(
                 err in msg
                 for err in ("Sold out", "잔여석없음", "예약대기자한도수초과")
             ):
-                if not _handle_error(ex):
+                if not error_handler.handle_error(ex, "코레일"):
                     return
             _sleep()
 
         except JSONDecodeError as ex:
-            if debug:
-                print(
-                    f"\nException: {ex}\nType: {type(ex)}\nArgs: {ex.args}\nMessage: {ex.msg}"
-                )
+            error_handler = ErrorHandler(debug=debug)
+            error_handler.handle_error(ex, "JSON 파싱")
             _sleep()
             rail = login(rail_type, debug=debug)
 
         except ConnectionError as ex:
-            if not _handle_error(ex, "연결이 끊겼습니다"):
+            error_handler = ErrorHandler(debug=debug)
+            if not error_handler.handle_error(ex, "네트워크"):
                 return
+            time.sleep(2)  # Wait a bit longer for network issues
             rail = login(rail_type, debug=debug)
 
         except Exception as ex:
-            if debug:
-                print("\nUndefined exception")
-            if not _handle_error(ex):
+            error_handler = ErrorHandler(debug=debug)
+            if not error_handler.handle_error(ex, "예상치 못한 오류"):
                 return
             rail = login(rail_type, debug=debug)
 
@@ -789,15 +787,105 @@ def _sleep():
     )
 
 
+class ErrorHandler:
+    """Enhanced error handler with retry logic and user-friendly messages"""
+
+    def __init__(self, debug=False):
+        self.debug = debug
+        self.retry_count = {}
+        self.max_retries = 3
+
+    def get_user_friendly_message(self, ex, error_type="일반"):
+        """Convert technical errors to user-friendly messages"""
+        if hasattr(ex, 'msg'):
+            msg = ex.msg
+        else:
+            msg = str(ex)
+
+        # Common error patterns and their user-friendly messages
+        error_patterns = {
+            "정상적인 경로로 접근 부탁드립니다": "🔄 서버 보안 검증 중입니다. 잠시 후 재시도합니다.",
+            "로그인 후 사용하십시오": "🔐 로그인이 만료되었습니다. 자동으로 재로그인합니다.",
+            "잔여석없음": "💺 좌석이 없습니다. 계속 검색 중입니다.",
+            "사용자가 많아 접속이 원활하지 않습니다": "🚦 서버가 혼잡합니다. 계속 시도 중입니다.",
+            "예약대기 접수가 마감되었습니다": "⏰ 예약대기 마감되었습니다. 일반 예약으로 시도 중입니다.",
+            "예약대기자한도수초과": "👥 예약대기 인원이 가득 찼습니다. 계속 확인 중입니다.",
+            "Sold out": "💺 매진되었습니다. 계속 검색 중입니다.",
+            "Need to Login": "🔐 로그인이 필요합니다. 자동으로 재로그인합니다."
+        }
+
+        for pattern, friendly_msg in error_patterns.items():
+            if pattern in msg:
+                return friendly_msg
+
+        # Connection errors
+        if "ConnectionError" in str(type(ex)) or "연결" in msg:
+            return "🌐 네트워크 연결에 문제가 있습니다. 재연결을 시도합니다."
+
+        # JSON decode errors
+        if "JSONDecodeError" in str(type(ex)):
+            return "📡 서버 응답 처리 중 오류가 발생했습니다. 재시도합니다."
+
+        # Generic error
+        if self.debug:
+            return f"🐛 [{error_type}] {msg}"
+        else:
+            return f"⚠️ 일시적인 오류가 발생했습니다. 재시도 중입니다."
+
+    def should_retry(self, error_key, ex):
+        """Determine if error should trigger a retry"""
+        if error_key not in self.retry_count:
+            self.retry_count[error_key] = 0
+
+        self.retry_count[error_key] += 1
+
+        # Don't retry certain critical errors
+        if hasattr(ex, 'msg'):
+            critical_errors = [
+                "계정이 잠겼습니다",
+                "잘못된 비밀번호",
+                "존재하지 않는 계정"
+            ]
+            if any(err in ex.msg for err in critical_errors):
+                return False
+
+        return self.retry_count[error_key] <= self.max_retries
+
+    def handle_error(self, ex, error_type="일반", custom_msg=None):
+        """Handle errors with improved user experience"""
+        if custom_msg:
+            user_msg = custom_msg
+        else:
+            user_msg = self.get_user_friendly_message(ex, error_type)
+
+        print(f"\n{user_msg}")
+
+        # Log detailed error for debugging
+        if self.debug:
+            debug_msg = f"[DEBUG] Exception: {ex}, Type: {type(ex).__name__}"
+            if hasattr(ex, 'msg'):
+                debug_msg += f", Message: {ex.msg}"
+            print(debug_msg)
+
+        # Send to telegram with user-friendly message
+        tgprintf = get_telegram()
+        if tgprintf:
+            asyncio.run(tgprintf(f"[SRTGO] {user_msg}"))
+
+        # For critical errors, ask user if they want to continue
+        error_key = str(type(ex).__name__)
+        if not self.should_retry(error_key, ex):
+            return inquirer.confirm(
+                message=f"오류가 {self.max_retries}회 연속 발생했습니다. 계속하시겠습니까?",
+                default=True
+            )
+
+        return True
+
 def _handle_error(ex, msg=None):
-    msg = (
-        msg
-        or f"\nException: {ex}, Type: {type(ex)}, Message: {ex.msg if hasattr(ex, 'msg') else 'No message attribute'}"
-    )
-    print(msg)
-    tgprintf = get_telegram()
-    asyncio.run(tgprintf(msg))
-    return inquirer.confirm(message="계속할까요", default=True)
+    """Legacy function for backward compatibility"""
+    handler = ErrorHandler(debug=False)
+    return handler.handle_error(ex, custom_msg=msg)
 
 
 def _is_seat_available(train, seat_type, rail_type):
